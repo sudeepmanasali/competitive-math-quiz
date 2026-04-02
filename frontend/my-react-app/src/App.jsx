@@ -104,10 +104,18 @@ export default function App() {
             onChange={(e) => setUsername(e.target.value)}
           />
 
-          <button style={styles.button} onClick={joinGame}>
+  
+        </div>
+
+         <div style={{ marginTop: 20 }}>
+        <button style={styles.button} onClick={joinGame}>
             Join
           </button>
+
+  
         </div>
+
+                
 
         <p style={styles.message}>{message}</p>
       </div>
@@ -139,10 +147,15 @@ export default function App() {
             onChange={(e) => setAnswer(e.target.value)}
           />
 
-          <button style={styles.button} onClick={submitAnswer}>
+       
+        </div>
+          <div style={{ marginTop: 12 }}>
+             <button style={styles.button} onClick={submitAnswer}>
             Submit
           </button>
+       
         </div>
+        
 
         <p style={styles.message}>{message}</p>
       </div>
@@ -220,7 +233,6 @@ const styles = {
     width: 220
   },
   button: {
-    marginLeft: 10,
     padding: "10px 16px",
     fontSize: 16,
     cursor: "pointer"
