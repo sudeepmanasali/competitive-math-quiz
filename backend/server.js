@@ -3,8 +3,12 @@ const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
+const Redis = require("ioredis");
+require("dotenv").config();
 
 const app = express();
+app.set("trust proxy", true);
+
 app.use(cors());
 app.use(express.json());
 
@@ -14,15 +18,13 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// ------------------ In-memory state ------------------
-let currentQuestion = null;
-let winnerLocked = false;
+// ------------------ Redis Setup ------------------
+const redis = new Redis(process.env.REDIS_URL);
 
-// userId -> { username }
-const users = new Map();
-
-// userId -> wins
-const leaderboard = new Map();
+// Redis Keys
+const CURRENT_QUESTION_KEY = "quiz:current_question";
+const LEADERBOARD_KEY = "quiz:leaderboard"; // sorted set
+const CONNECTED_USERS_KEY = "quiz:connected_users"; // set
 
 // ------------------ Question Generator ------------------
 function generateQuestion() {
@@ -45,32 +47,41 @@ function generateQuestion() {
 }
 
 // ------------------ Create & Broadcast Question ------------------
-function createNewQuestion() {
-  currentQuestion = generateQuestion();
-  winnerLocked = false;
+async function createNewQuestion() {
+  const q = generateQuestion();
 
-  console.log(
-    `NEW QUESTION => ${currentQuestion.problem} = ${currentQuestion.answer}`
-  );
+  await redis.set(CURRENT_QUESTION_KEY, JSON.stringify(q));
 
   io.emit("newQuestion", {
-    questionId: currentQuestion.questionId,
-    problem: currentQuestion.problem
+    questionId: q.questionId,
+    problem: q.problem
   });
+
+  console.log(`NEW QUESTION => ${q.problem} = ${q.answer}`);
+
+  return q;
 }
 
-// Initialize first question
-createNewQuestion();
+// ------------------ Ensure question exists ------------------
+async function ensureQuestionExists() {
+  const raw = await redis.get(CURRENT_QUESTION_KEY);
+
+  if (!raw) {
+    return await createNewQuestion();
+  }
+
+  return JSON.parse(raw);
+}
 
 // ------------------ Routes ------------------
 
 // Health check
 app.get("/", (req, res) => {
-  res.send("Math Quiz Backend Running");
+  res.send("Math Quiz Backend Running (Redis Enabled)");
 });
 
-// Join user (generate unique userId)
-app.post("/join", (req, res) => {
+// Join user (store in redis)
+app.post("/join", async (req, res) => {
   const { username } = req.body;
 
   if (!username || !username.trim()) {
@@ -78,7 +89,14 @@ app.post("/join", (req, res) => {
   }
 
   const userId = uuidv4();
-  users.set(userId, { username });
+
+  // Store user as redis hash
+  await redis.hset(`quiz:user:${userId}`, {
+    username
+  });
+
+  // give user record TTL (optional)
+  await redis.expire(`quiz:user:${userId}`, 60 * 60 * 24); // 24 hours
 
   res.json({
     userId,
@@ -87,70 +105,81 @@ app.post("/join", (req, res) => {
 });
 
 // Get current question
-app.get("/question", (req, res) => {
-  if (!currentQuestion) createNewQuestion();
+app.get("/question", async (req, res) => {
+  const q = await ensureQuestionExists();
 
   res.json({
-    questionId: currentQuestion.questionId,
-    problem: currentQuestion.problem
+    questionId: q.questionId,
+    problem: q.problem
   });
 });
 
 // Submit answer
-app.post("/submit", (req, res) => {
+app.post("/submit", async (req, res) => {
   const { userId, questionId, answer } = req.body;
 
   if (!userId || !questionId || answer === undefined) {
     return res.status(400).json({ message: "Missing fields." });
   }
 
-  const user = users.get(userId);
-  if (!user) {
+  // fetch user
+  const user = await redis.hgetall(`quiz:user:${userId}`);
+  if (!user || !user.username) {
     return res.status(400).json({ message: "Invalid user. Please join again." });
   }
 
-  if (!currentQuestion) {
+  // fetch current question
+  const qRaw = await redis.get(CURRENT_QUESTION_KEY);
+  if (!qRaw) {
     return res.status(400).json({ message: "No question active." });
   }
 
+  const q = JSON.parse(qRaw);
+
   // old question
-  if (questionId !== currentQuestion.questionId) {
+  if (questionId !== q.questionId) {
     return res.json({
       correct: false,
       message: "Too late. Question already changed."
     });
   }
 
-  // already winner
-  if (winnerLocked) {
-    return res.json({
-      correct: false,
-      message: "Someone already won this round."
-    });
-  }
-
-  // incorrect
-  if (Number(answer) !== Number(currentQuestion.answer)) {
+  // wrong answer
+  if (Number(answer) !== Number(q.answer)) {
     return res.json({
       correct: false,
       message: "Wrong answer."
     });
   }
 
-  // Winner found
-  winnerLocked = true;
+  // ------------------ Winner Lock (Concurrency Safe) ------------------
+  // Only first correct submission wins.
+  const winnerKey = `quiz:winner:${q.questionId}`;
 
-  const wins = leaderboard.get(userId) || 0;
-  leaderboard.set(userId, wins + 1);
+  // NX = only set if doesn't exist
+  // EX = auto expire (cleanup)
+  const winnerSet = await redis.set(winnerKey, userId, "NX", "EX", 30);
 
+  if (!winnerSet) {
+    return res.json({
+      correct: false,
+      message: "Someone already won this round."
+    });
+  }
+
+  // Update leaderboard (sorted set)
+  await redis.zincrby(LEADERBOARD_KEY, 1, userId);
+
+  // Broadcast winner
   io.emit("winner", {
     username: user.username,
-    problem: currentQuestion.problem,
-    answer: currentQuestion.answer
+    problem: q.problem,
+    answer: q.answer
   });
 
-  setTimeout(() => {
-    createNewQuestion();
+  // Generate next question after delay
+  setTimeout(async () => {
+    await createNewQuestion();
   }, 2000);
 
   return res.json({
@@ -160,41 +189,57 @@ app.post("/submit", (req, res) => {
 });
 
 // Leaderboard
-app.get("/leaderboard", (req, res) => {
-  const sorted = Array.from(leaderboard.entries())
-    .map(([userId, wins]) => {
-      const user = users.get(userId) || { username: "Unknown" };
-      return {
-        userId,
-        username: user.username,
-        wins
-      };
-    })
-    .sort((a, b) => b.wins - a.wins)
-    .slice(0, 10);
+app.get("/leaderboard", async (req, res) => {
+  const data = await redis.zrevrange(LEADERBOARD_KEY, 0, 9, "WITHSCORES");
 
-  res.json(sorted);
-});
+  const leaderboard = [];
 
-// ------------------ Socket.IO ------------------
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
+  for (let i = 0; i < data.length; i += 2) {
+    const userId = data[i];
+    const wins = Number(data[i + 1]);
 
-  if (currentQuestion) {
-    socket.emit("newQuestion", {
-      questionId: currentQuestion.questionId,
-      problem: currentQuestion.problem
+    const user = await redis.hgetall(`quiz:user:${userId}`);
+    leaderboard.push({
+      userId,
+      username: user.username || "Unknown",
+      wins
     });
   }
 
-  socket.on("disconnect", () => {
+  res.json(leaderboard);
+});
+
+// Active Users Count (optional endpoint)
+app.get("/active-users", async (req, res) => {
+  const count = await redis.scard(CONNECTED_USERS_KEY);
+  res.json({ activeUsers: count });
+});
+
+// ------------------ Socket.IO ------------------
+io.on("connection", async (socket) => {
+  console.log("Client connected:", socket.id);
+
+  // track socket in redis
+  await redis.sadd(CONNECTED_USERS_KEY, socket.id);
+
+  // send question on connect
+  const q = await ensureQuestionExists();
+
+  socket.emit("newQuestion", {
+    questionId: q.questionId,
+    problem: q.problem
+  });
+
+  socket.on("disconnect", async () => {
     console.log("Client disconnected:", socket.id);
+    await redis.srem(CONNECTED_USERS_KEY, socket.id);
   });
 });
 
 // ------------------ Start Server ------------------
 const PORT = process.env.PORT || 8080;
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
+  await ensureQuestionExists();
   console.log(`Server running on port ${PORT}`);
 });
